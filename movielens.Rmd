@@ -1,0 +1,452 @@
+---
+title: "Movielens Capstone project"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(error = TRUE)
+
+options(digits=7)
+
+```
+# Introduction
+
+This is a personnal work about the movielens project. The objective is to propose a model to estimate movie ratings for a given set of users.
+The dataset is built as in the course instructions. A RMSE function is used to compare the models. 
+A first model takes in consideration a time effect, as the ratings show a variable trend according to their time-stamp.
+
+We are going to use the following libraries:
+  
+```{r loading-libs, message=FALSE}
+library(tidyverse)
+library(caret)
+library(lubridate)
+library(gridExtra)
+```
+
+# Preliminaries
+## Dataset
+We first load the `edx` training and `validation` set. These were initialised from the code provided in the course material, by separating the global movielens dat in a 90/10 proportion.
+
+
+```{r load data, message=FALSE}
+load(file.path("rda","initial-set.rda"))
+nrow(edx)
+nrow(validation)
+```
+
+Here is a subset of our data:
+```{r }
+tibble(edx) %>% head
+```
+
+The `edx` set contains `r edx %>% select(movieId) %>% distinct() %>% nrow() ` movies and `r edx %>% select(userId) %>% distinct() %>% nrow() ` users. This is a large dataset and we must account for it in our modeling approach. 
+
+## RMSE function
+We define a RMSE function that will help us to compare the different models by calculating the mean square error, between the prediction vector and the vector of real ratings.
+
+```{r rmse function}
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+# First model : time effect
+
+As a first step we are checking for a time effect in ratings, then we'll compute a corrective term to account for this in the following steps.
+
+## Global average rating 
+First, let's calculate the global average rating.
+```{r}
+mu <- mean(edx$rating)
+mu
+```
+As a very basic model we consider the average rating mu as prediction. We evaluate this with the validation set.
+```{r rmse-simple-model}
+predicted_ratings <- rep(mu,length(validation$rating))
+rmse_val <- RMSE(predicted_ratings, validation$rating) 
+rmse_results <- tibble(method = "Prediction with the mean rating", RMSE = rmse_val)
+rmse_val
+```
+
+## Ratings evolution through time
+
+We consider the time effect with a one week granularity. We compute the difference between the current mean and the long term mean (mu). Then we fit a loess model in order to smooth the time effect. We set the span to 5 years.
+
+```{r compute-week-effect}
+week_effect <- edx %>% 
+  mutate (date = as_datetime(timestamp), week=round_date(date,unit="week")) %>% 
+  group_by(week) %>% 
+  summarize(avgweekeffect = mean(rating)-mu) 
+span <- 5*52/nrow(week_effect)
+weekfit<-loess(avgweekeffect~as.numeric(week),degree = 1, span = span, data = week_effect)
+```
+
+This plot shows the weekly average rating (black dots), with the associated geom_smooth in blue, and our loess time effect in red. The red and blue lines are very close, which we wanted.
+```{r plot-week-effect}
+edx %>% mutate (date = as_datetime(timestamp), week=round_date(date,unit="week")) %>%
+  group_by(week) %>% 
+  summarize(weekrating = mean(rating)) %>%
+  mutate(timeeffect = mu+weekfit$fitted) %>%
+  ggplot(aes(week, weekrating)) +
+  geom_point() +  geom_smooth() +
+  geom_line(aes(week, timeeffect), color="red") +
+  xlab("time")+ylab("average rating")+ggtitle("Average ratings evolution")
+```
+
+## Time-effect model
+
+Our model is:   
+$Y = \mu + TE(t)$  
+where mu is the long term average, TE is the time effect function of time t.  
+We evaluate the time-effect model against the validation set. Note that there is hopefully no missing time-effect point for the merge with the validation set, else we would have needed to interpolate the missing values. 
+
+```{r rmse-week-effect, warning = FALSE}
+time_effect <- data.frame(week=week_effect$week, time_effect = weekfit$fitted)
+
+predicted_ratings <- validation %>% 
+  mutate (date = as_datetime(timestamp), week=round_date(date,unit="week")) %>% 
+  left_join(time_effect, by="week") %>%
+  mutate(pred = mu + time_effect ) %>% 
+  pull(pred)
+
+rmse_val <- RMSE(predicted_ratings, validation$rating) 
+rmse_results <- bind_rows(rmse_results, 
+                          data_frame(method="Additional Time effect", RMSE = rmse_val ))
+rmse_results %>% knitr::kable()
+```
+
+If we compare the RMSE, we can see that the time-effect brings a very small improvement to our predictions.
+We're going to look at other additional effects. We keep the time effect to the `edx` set for future use. 
+
+```{r edx-time-effect}
+edx <- edx %>% 
+  mutate (date = as_datetime(timestamp), week=round_date(date,unit="week")) %>% 
+  left_join(time_effect, by="week") 
+```
+
+# Second model : user and movie effect
+As in the course material, we consider the model :  
+$Y(u,i) = \mu + TE(t) + b_u + b_i + \epsilon(u,i)$
+
+Where:  
+$Y(u,i)$ is the rating of movie $i$ by user $u$  
+$TE(t)$ is the time effect for time $t$  
+$b_u$ is the effect for user $u$  
+$b_i$ is the effect for movie $i$  
+$\epsilon(u,i)$ are independant random variables of mean 0  
+
+## Regularization
+We use a regularization factor `lambda` to minimize the total variance  
+$V = \sum(\hat{y}-Y)^2+lambda*(\sum b_i^2 +\sum b_u^2 )$
+
+We partition the training set `edx` in order to look for an optimal `lambda` with a 20% partition. We make sure the test set does not contain unknown items. 
+
+```{r partition}
+edx_index <- createDataPartition(y = edx$rating, times = 1, p = 0.2, list = FALSE)
+train_lambda <- edx[-edx_index,]
+temp <- edx[edx_index,]
+
+test_lambda <- temp %>% 
+  semi_join(train_lambda, by = "movieId") %>%
+  semi_join(train_lambda, by = "userId")
+removed <- anti_join(temp, test_lambda, by = c("userId", "movieId"))
+train_lambda <- rbind(train_lambda, removed)
+```
+
+We look for a lambda with the lower RMSE. Our training set is `train_lambda` and our testing set is `test_lambda`.
+
+```{r optimlambda}
+lambdas <- seq(0, 20, 1)
+rmses <- sapply(lambdas, function(l){
+  b_i <- train_lambda %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu - time_effect)/(n()+l)) 
+  b_u <- train_lambda %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu - time_effect)/(n()+l))
+  predicted_ratings <- 
+    test_lambda %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + time_effect + b_i + b_u) %>% 
+    pull(pred)
+  return(RMSE(predicted_ratings, test_lambda$rating))
+})
+``` 
+
+```{r plot lambda}
+qplot(lambdas, rmses, main="RMSE score against lambda")  
+
+lambda <- lambdas[which.min(rmses)]
+lambda
+```
+
+We'll keep the value of lambda=`r lambda` for the future steps. Now we compute the b_u and b_i vectors with the final value of lambda.
+```{r compute bi bu}
+b_i <- edx %>% 
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu - time_effect)/(n()+lambda)) 
+b_u <- edx %>% 
+  left_join(b_i, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - b_i - mu - time_effect)/(n()+lambda))
+```
+
+```{r clean mem, include = FALSE}
+rm(train_lambda,test_lambda,temp, removed, edx_index)
+
+```
+
+
+## Score
+To assess our model we compute the RMSE score against the validation set, using the model vectors calibrated over the training set. 
+
+```{r rmse validation user movie}
+predicted_ratings <- validation %>% 
+  mutate (date = as_datetime(timestamp), week=round_date(date,unit="week")) %>% 
+  left_join(time_effect, by="week") %>%
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  mutate(pred = mu + time_effect + b_i + b_u) %>% 
+  pull(pred)
+
+rmse_val <- RMSE(predicted_ratings, validation$rating)
+rmse_val
+
+rmse_results <- bind_rows(rmse_results, 
+                          data_frame(method="User and movie effects model", RMSE = rmse_val ))
+rmse_results %>% knitr::kable()
+```
+
+# Genre effect model
+
+## Exploring the residuals and breaking by genres 
+
+To improve the prediction, we try to explore the residuals broken by genre.   
+First we evaluate the whole list of atomic values for column genres:
+```{r genres}
+genres_l <- edx %>% 
+  pull(genres) %>% unique() 
+genres_l <- str_split(genres_l,"\\|", simplify =  FALSE)
+genres_l <- sapply(genres_l, function(x) {paste(x, sep=" ",collapse=" ") })
+genres_l <- paste(genres_l, collapse=" ")
+genres_l <- data.frame(str_split(genres_l," "))%>% unique 
+names(genres_l)<-c("genre")
+genre_columns <- str_c("genre",seq(1,nrow(genres_l)),sep="_")
+```
+This will help us to detail the ratings per unitary genres:
+```{r example genres}
+edx %>% filter(userId==1 & movieId==292) %>% select(userId,movieId,genres) %>% knitr::kable()
+
+edx%>% filter(userId==1 & movieId==292) %>% 
+  separate(genres,sep="\\|", into = genre_columns, fill="right",extra="drop") %>% 
+  gather(dummy, genre, all_of(genre_columns)) %>% 
+  select(-dummy) %>% 
+  filter(!is.na(genre)) %>% 
+  select(userId,movieId,genre) %>% knitr::kable()
+
+```
+
+Memory consumption is important with the whole dataset. To ease things we'll focus on two subsets and explore movie genres inside thses two subsets :  
+* one subset containing the data related to the 100 users giving the  worst predictions  
+* one subset containing the data for a random selection of 100 users  
+```{r subset of users}
+users_worst <- edx %>% 
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  mutate(residual = mu + b_i + b_u + time_effect - rating) %>%
+  arrange(desc(abs(residual))) %>% 
+  select(userId)  %>%  unique %>% slice(1:100) %>% pull(userId)
+
+users_rand <- edx %>% 
+  filter( userId %in% sample(userId, 100) ) %>% 
+  pull(userId) %>% unique
+
+edx_worst <- edx %>% filter(userId %in% users_worst) %>% 
+  separate(genres,sep="\\|", into = genre_columns, fill="right",extra="drop") %>% 
+  gather(dummy, genre, all_of(genre_columns)) %>% select(-dummy) %>% filter(!is.na(genre))
+
+edx_rand <- edx %>% filter(userId %in% users_rand) %>% 
+  separate(genres,sep="\\|", into = genre_columns, fill="right",extra="drop") %>% 
+  gather(dummy, genre, all_of(genre_columns)) %>% select(-dummy) %>% filter(!is.na(genre))
+
+```
+
+Let's have a look at the ratings for the two groups, broken by genre.  
+Worst group.  
+```{r worst group count}
+edx_worst %>% group_by(genre) %>% 
+  summarize(count=n(), mean=mean(rating), median=median(rating),sd=sd(rating)) %>% 
+  arrange (mean) %>% knitr::kable()
+```
+
+Random group.  
+
+```{r random group count}
+edx_rand %>% group_by(genre) %>% 
+  summarize(count=n(), mean=mean(rating), median=median(rating),sd=sd(rating)) %>% 
+  arrange (mean)%>% knitr::kable()
+```
+
+It appears that the worst group ratings are less close to the average $\mu$ than the random group. If we check at the user effect $b_u$ we can see it is more important on the worst group. This could explain the amplification of residual errors.  
+```{r user effect in subsets, message=FALSE, warning = FALSE}
+h1 <- edx_worst %>% 
+  left_join(b_u) %>% 
+  group_by(userId) %>% 
+  summarize(b_u = first(b_u) ) %>% 
+  ggplot(aes(b_u)) + geom_histogram() + 
+  ggtitle("100 worst residuals users") + ylim(0,20)
+h2 <- edx_rand %>% 
+  left_join(b_u) %>% 
+  group_by(userId) %>% 
+  summarize(b_u = first(b_u) ) %>% 
+  ggplot(aes(b_u)) + geom_histogram() + 
+  ggtitle("100 users random sample") + ylim(0,20)
+grid.arrange(h1, h2, ncol = 2)
+```
+
+If we display the histograms of ratings, broken by genre, for the random selection of users, it shows clearly a general genre effect :
+
+```{r genres histograms, message=FALSE}
+edx_rand %>% 
+  group_by(genre, userId) %>% summarize(rating=mean(rating)) %>% 
+  ggplot(aes(rating)) + geom_histogram() + 
+  facet_wrap(. ~ genre) + ggtitle("Distribution of ratings by genre.")
+```
+
+Now we look at the ratings boxplots broken by genre, and compare the two groups. We can see the variance is globally much more important in the in the group of worst rating users, and there is also more variance between the different genres for that group.
+
+```{r genres boxplots, message=FALSE, warning=FALSE}
+h1 <- edx_worst  %>% 
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  mutate(residual = mu + b_i + b_u + time_effect - rating) %>%
+  ggplot(aes(y=genre,x=residual))+geom_boxplot()+ggtitle("100 worst residuals users")+xlim(-5,5)
+h2 <- edx_rand  %>% 
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  mutate(residual = mu + b_i + b_u + time_effect - rating) %>%
+  ggplot(aes(y=genre,x=residual))+geom_boxplot()+ggtitle("100 random sample users")+xlim(-5,5)
+grid.arrange(h1, h2, nrow = 2) 
+```
+
+In conclusion, there seems to be a genre effect. That effect could be approximately similar for a large part of users. For users with the worst predictions the genre effect seems to be different from one user to another. So we could try take into account a variability of genre for each user.
+
+```{r clean mem 2, include = FALSE}
+rm (rand_users, worst_users, edx_rand,  edx_worst, h1, h2) 
+```
+
+## Modeling the genre effect
+
+We assume a model accounting for a mean rating per genre for each user:  
+
+$$Y(i,u) = \mu + TE(t) + b_i + b_u + mean ( b_{u,k} )$$
+where: $b_{u,k}$ is the average residual for user u and movies of genre k. The mean is calculated over the genres k related to movie i.
+
+First we perform a tidy of the genres column, and create a movie/genre separate table to optimize memory consumption.
+```{r moviesgenre}
+moviegenres <- edx %>% select(movieId,genres) %>% distinct() %>%
+  separate(genres,sep="\\|", 
+           into = tidyselect::all_of(genre_columns), 
+           fill="right",
+           extra="drop") %>% 
+  gather(dummy, genre, tidyselect::all_of(genre_columns)) %>% select(-dummy) %>% 
+  filter(!is.na(genre)) 
+
+head(moviegenres)%>% knitr::kable()
+```
+
+Now let's compute the new predictor, b_u_k, for each user and genre. Note that regularisation here seems to bring no benefit.
+
+```{r buk}
+b_u_k <- edx %>% 
+  left_join(moviegenres, by="movieId") %>% 
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  mutate(residual = mu + b_i + b_u + time_effect - rating) %>%
+  group_by(userId, genre) %>%
+  summarize(b_u_k = sum(rating -time_effect - b_i - b_u -mu)/n()) 
+
+```
+
+To illustrate, let's consider an example: user id 1 with movie id 122.
+
+```{r example}
+edx %>% filter(userId==1 & movieId==122) %>% knitr::kable()
+ex_bi<-b_i %>% filter(movieId==122) %>% pull(b_i)
+ex_bu<-b_u %>% filter(userId==1) %>% pull(b_u)
+ex_te <- edx %>% filter(userId==1 & movieId==122) %>% pull(time_effect)
+ex_buk <- b_u_k %>% filter(userId==1 & genre %in% c("Comedy","Romance"))
+```
+The user-genre contribution shows 2 lines for the considered movie
+`r ex_buk %>% knitr::kable()`  
+We thus have a contribution of `mean(ex_buk$b_u_k)` = `r mean(ex_buk$b_u_k)` for the genre effect.  
+The final prediction is  :
+```{r example-end}
+tibble (mu=mu, b_u=ex_bu, b_i=ex_bi,b_uki=mean(ex_buk$b_u_k), te=ex_te) %>% 
+  mutate(prediction = mu + b_u + b_i + te + b_uki)
+```
+
+## RMSE Score
+We compute the RMSE on the validation set. Note that it can happen that a combination of user+genre was not present in the training set. In that case the effect will be null for the given genre. We also cap the prediction to a value of 5 and floor it to 1.
+
+```{r rmse buk}
+pred_val <- validation %>%  
+  mutate (date = as_datetime(timestamp), week=round_date(date,unit="week")) %>% 
+  left_join(time_effect, by="week") %>%
+  left_join(moviegenres, by = "movieId") %>%
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_u_k, by = c("userId","genre")) %>%
+  group_by(userId,movieId) %>%
+  summarize(b_uki = mean(b_u_k, na.rm = TRUE), 
+            b_u = first(b_u), 
+            b_i = first(b_i), 
+            rating = first(rating),
+            time_effect = first(time_effect)) %>%
+  mutate( estimate = mu + time_effect + b_i + b_u + ifelse(!is.na(b_uki), b_uki,0), 
+          pred = ifelse(estimate > 5,5, ifelse(estimate<1,1,estimate))) %>% 
+  select(userId,movieId,pred)
+
+predicted_val <- left_join(validation, pred_val , by=c("userId","movieId")) %>% pull(pred)
+rmse_val <- RMSE(predicted_val, validation$rating) 
+
+rmse_results <- bind_rows(rmse_results, 
+                          data_frame(method="Additional User-Genre effect model", RMSE = rmse_val ))
+rmse_results %>% knitr::kable()
+```
+
+# Other approaches
+
+Here are a few methodologies I tried to explore. Since the results were not satisfactory I do not report these sections in details.
+
+## residual matrix factorization
+The SVD factorization could be an interesting approach to catch the correlations between combinations of users and movies. We start from the user-movie model. We have to build a matrix of 70000 users x 10000 movies, containing the residuals (=prediction-rating). The NAs are replaced with zeros.  
+Unfortunately if we perform a SVD on the whole matrix we get short of memory on a 16GB RAM computer. Therefore, we limit the scope of the matrix on a subset of 6000 users and 1000 movies containing the worst predictions. On the 3 SVD matrices, we keep 500 first components out of 1000 in order to preserve around 90% of the total variance. Then we compute back the original matrix, which we can use to estimate a residual correction on the validation set.  
+The gain is approximately 0.0005 on the RMSE.
+
+## clustering
+The clustering methods were applied on the user + movies + genre effect residual model.  
+
+### Hierarchical
+I used again the matrix of residuals, NA values filled with zero, and explored a hierarchical clustering on users. I tried different values for the cutoff height, but this was not succesfull to separate efficiently the users (I obtained a lot of groups of 1 user and a few very  large groups).
+
+### Kmeans
+The kmeans algorithms is applied (1) on the residual matrix, to compute groups of users, or (2) on the transposed matrix to compute groups of movies.  
+In each case, when inspecting the groups, we still have a large variance of residuals, thus it is not obvious how to exploit this information. Nevertheless I tried to use these groups with the random forest.
+
+## Trees
+Random forest cannot be applied to a too large set of factors, so we have to exclude applying RF on every users or every movies. Rather, I tried to apply the RF on the groups of users and groups of movies that were computed using kmean. Unfortunately, though the idea seems interesting, the prediction is quite bad.
+
+# Conclusions
+We finally have the following RMSE scores:
+```{r conclusion}
+rmse_results %>% knitr::kable()
+```
+
+To improve significantly this score seems difficult without a specific model. The SVD factorisation can bring a small improvment. The clustering or regression trees methods might be analysed deeper to check for a possible improvment.  
+
+
